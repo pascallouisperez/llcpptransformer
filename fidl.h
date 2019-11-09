@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <stdint.h>
 
+#define ZX_OBJ_TYPE_CHANNEL 4
+
 #if !defined(__cplusplus)
 #if defined(__GNUC__) && \
     (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__) < 40800
