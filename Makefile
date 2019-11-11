@@ -24,6 +24,7 @@ clean:
 fromf:
 	cp $$FUCHSIA_DIR/zircon/system/utest/fidl/transformer.test.fidl .
 	cp $$FUCHSIA_DIR/zircon/system/utest/fidl/transformer_tests.cc .
+	cp $$FUCHSIA_DIR/zircon/system/utest/fidl/generated/transformer_tables.test.h tables.h
 	cp $$FUCHSIA_DIR/zircon/system/ulib/fidl/transformer.cc .
 
 tof:

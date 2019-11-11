@@ -47,6 +47,10 @@ typedef int32_t zx_status_t;
 #define ZX_ERR_INVALID_ARGS (-10)
 #define ZX_ERR_BUFFER_TOO_SMALL (-789)
 
+typedef uint32_t zx_obj_type_t;
+
+#define ZX_OBJ_TYPE_CHANNEL         ((zx_obj_type_t)4u)
+
 #define FIDL_MAX_SIZE UINT32_MAX
 
 #define ZX_OBJ_TYPE_NONE            ((uint32_t)0u)
