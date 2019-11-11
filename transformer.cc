@@ -39,21 +39,40 @@ struct TraversalResult {
   }
 };
 
-// TODO(apang): I think we can get rid of the wire_format parameter by just doing union.alt.
-// TODO(apang): This may not return the aligned size, since e.g. "type->coded_struct.size" below may
-// be unaligned
-uint32_t AlignedInlineSize(const fidl_type_t* type, WireFormat wire_format) {
-  if (!type) {
-    // For integral types (i.e. primitive, enum, bits).
-    // TODO(apang): This returns the aligned size... but structs etc below don't return the aligned
-    // size :/
-    return 8;
+constexpr uint32_t PrimitiveSize(const fidl::FidlCodedPrimitive primitive) {
+  switch (primitive) {
+    case fidl::FidlCodedPrimitive::kBool:
+    case fidl::FidlCodedPrimitive::kInt8:
+    case fidl::FidlCodedPrimitive::kUint8:
+      return 1;
+    case fidl::FidlCodedPrimitive::kInt16:
+    case fidl::FidlCodedPrimitive::kUint16:
+      return 2;
+    case fidl::FidlCodedPrimitive::kInt32:
+    case fidl::FidlCodedPrimitive::kUint32:
+    case fidl::FidlCodedPrimitive::kFloat32:
+      return 4;
+    case fidl::FidlCodedPrimitive::kInt64:
+    case fidl::FidlCodedPrimitive::kUint64:
+    case fidl::FidlCodedPrimitive::kFloat64:
+      return 8;
   }
+  __builtin_unreachable();
+}
+
+// This function is named UnsafeInlineSize since it assumes that |type| will be
+// non-null. Don't call this function directly; instead, call
+// TransformerBase::InlineSize().
+uint32_t UnsafeInlineSize(const fidl_type_t* type, WireFormat wire_format) {
+  assert(type);
+
   switch (type->type_tag) {
     case fidl::kFidlTypePrimitive:
+      return PrimitiveSize(type->coded_primitive);
     case fidl::kFidlTypeEnum:
+      return PrimitiveSize(type->coded_enum.underlying_type);
     case fidl::kFidlTypeBits:
-      return 8;
+      return PrimitiveSize(type->coded_bits.underlying_type);
     case fidl::kFidlTypeStructPointer:
       return 8;
     case fidl::kFidlTypeUnionPointer:
@@ -137,17 +156,17 @@ struct Position {
 class SrcDst final {
  public:
   SrcDst(const uint8_t* src_bytes, const uint32_t src_num_bytes, uint8_t* dst_bytes,
-         uint32_t* out_dst_num_bytes)
+         uint32_t dst_num_bytes_capacity, uint32_t* out_dst_num_bytes)
       : src_bytes_(src_bytes),
         src_num_bytes_(src_num_bytes),
         dst_bytes_(dst_bytes),
+        dst_num_bytes_capacity_(dst_num_bytes_capacity),
         out_dst_num_bytes_(out_dst_num_bytes) {}
   SrcDst(const SrcDst&) = delete;
 
   ~SrcDst() { *out_dst_num_bytes_ = dst_max_offset_; }
 
-  // TODO(apang): Change |position| arg to src_offset
-  template <typename T>  // TODO(apang): restrict T should be pointer type
+  template <typename T>
   const T* __attribute__((warn_unused_result)) Read(const Position& position) const {
     uint32_t size = sizeof(T);
     if (!(position.src_inline_offset + size <= src_num_bytes_)) {
@@ -157,42 +176,55 @@ class SrcDst final {
     return reinterpret_cast<const T*>(src_bytes_ + position.src_inline_offset);
   }
 
-  // TODO(apang): Rename to CopyInline?
-  void Copy(const Position& position, uint32_t size) {
-    assert(position.src_inline_offset + size <= src_num_bytes_);
+  zx_status_t __attribute__((warn_unused_result)) Copy(const Position& position, uint32_t size) {
+    if (!(position.src_inline_offset + size <= src_num_bytes_)) {
+      return ZX_ERR_BAD_STATE;
+    }
 
+    const auto status = UpdateMaxOffset(position.dst_inline_offset + size);
+    if (status != ZX_OK) {
+      return status;
+    }
     memcpy(dst_bytes_ + position.dst_inline_offset, src_bytes_ + position.src_inline_offset, size);
-    UpdateMaxOffset(position.dst_inline_offset + size);
+    return ZX_OK;
   }
 
-  // TODO(apang): Rename to PadInline
-  void Pad(const Position& position, uint32_t size) {
+  zx_status_t __attribute__((warn_unused_result)) Pad(const Position& position, uint32_t size) {
+    const auto status = UpdateMaxOffset(position.dst_inline_offset + size);
+    if (status != ZX_OK) {
+      return status;
+    }
     memset(dst_bytes_ + position.dst_inline_offset, 0, size);
-    UpdateMaxOffset(position.dst_inline_offset + size);
-  }
-
-  void PadOutOfLine(const Position& position, uint32_t size) {
-    memset(dst_bytes_ + position.dst_out_of_line_offset, 0, size);
-    UpdateMaxOffset(position.dst_out_of_line_offset + size);
+    return ZX_OK;
   }
 
   template <typename T>
-  void Write(const Position& position, T value) {
+  zx_status_t __attribute__((warn_unused_result)) Write(const Position& position, T value) {
+    const auto size = static_cast<uint32_t>(sizeof(value));
+    const auto status = UpdateMaxOffset(position.dst_inline_offset + size);
+    if (status != ZX_OK) {
+      return status;
+    }
     auto ptr = reinterpret_cast<T*>(dst_bytes_ + position.dst_inline_offset);
     *ptr = value;
-    UpdateMaxOffset(position.dst_inline_offset + static_cast<uint32_t>(sizeof(value)));
+    return ZX_OK;
   }
 
  private:
-  void UpdateMaxOffset(uint32_t dst_offset) {
+  zx_status_t __attribute__((warn_unused_result)) UpdateMaxOffset(uint32_t dst_offset) {
     if (dst_offset > dst_max_offset_) {
+      if (!(dst_offset <= dst_num_bytes_capacity_)) {
+        return ZX_ERR_BAD_STATE;
+      }
       dst_max_offset_ = dst_offset;
     }
+    return ZX_OK;
   }
 
   const uint8_t* src_bytes_;
   const uint32_t src_num_bytes_;
   uint8_t* dst_bytes_;
+  const uint32_t dst_num_bytes_capacity_;
   uint32_t* out_dst_num_bytes_;
 
   uint32_t dst_max_offset_ = 0;
@@ -204,28 +236,27 @@ class TransformerBase {
       : src_dst(src_dst), out_error_msg_(out_error_msg) {}
   virtual ~TransformerBase() = default;
 
-  uint32_t AlignedAltInlineSize(const fidl_type_t* type) {
-    if (!type) {
-      return AlignedInlineSize(nullptr, To());
-    }
+  uint32_t InlineSize(const fidl_type_t* type, WireFormat wire_format) {
+    assert(type);
+
+    return UnsafeInlineSize(type, wire_format);
+  }
+
+  uint32_t AltInlineSize(const fidl_type_t* type) {
+    assert(type);
 
     switch (type->type_tag) {
-        // Note that for structs, unions, and arrays, we need to FIDL_ALIGN the
-        // return value, because the AlignedInlineSize() function is a misnomer:
-        // it doesn't always return the aligned value. (See the TODO in that
-        // function's comment.)
-
       case fidl::kFidlTypeStruct: {
         const fidl_type_t ft(*type->coded_struct.alt_type);
-        return FIDL_ALIGN(AlignedInlineSize(&ft, To()));
+        return InlineSize(&ft, To());
       }
       case fidl::kFidlTypeUnion: {
         const fidl_type_t ft(*type->coded_union.alt_type);
-        return FIDL_ALIGN(AlignedInlineSize(&ft, To()));
+        return InlineSize(&ft, To());
       }
       case fidl::kFidlTypeArray: {
         const fidl_type_t ft(*type->coded_array.alt_type);
-        return FIDL_ALIGN(AlignedInlineSize(&ft, To()));
+        return InlineSize(&ft, To());
       }
       case fidl::kFidlTypePrimitive:
       case fidl::kFidlTypeEnum:
@@ -237,7 +268,7 @@ class TransformerBase {
       case fidl::kFidlTypeXUnion:
       case fidl::kFidlTypeHandle:
       case fidl::kFidlTypeTable:
-        return AlignedInlineSize(type, To());
+        return InlineSize(type, To());
     }
 
     assert(false && "unexpected non-exhaustive switch on fidl::FidlTypeTag");
@@ -264,27 +295,16 @@ class TransformerBase {
  protected:
   zx_status_t Transform(const fidl_type_t* type, const Position& position, const uint32_t dst_size,
                         TraversalResult* out_traversal_result) {
-    auto copy = [&] {
-      src_dst->Copy(position, dst_size);
-      return ZX_OK;
-    };
-
     if (!type) {
-      return copy();
+      return src_dst->Copy(position, dst_size);
     }
-
     switch (type->type_tag) {
-      case fidl::kFidlTypeHandle: {
-        auto presence = *src_dst->Read<uint32_t>(position);
-        if (presence == FIDL_HANDLE_PRESENT) {
-          out_traversal_result->handle_count++;
-        }
-        // fallthrough
-      }
+      case fidl::kFidlTypeHandle:
+        return TransformHandle(position, dst_size, out_traversal_result);
       case fidl::kFidlTypePrimitive:
       case fidl::kFidlTypeEnum:
       case fidl::kFidlTypeBits:
-        return copy();
+        return src_dst->Copy(position, dst_size);
       case fidl::kFidlTypeStructPointer: {
         const auto& src_coded_struct = *type->coded_struct_pointer.struct_type;
         const auto& dst_coded_struct = *src_coded_struct.alt_type;
@@ -317,8 +337,7 @@ class TransformerBase {
         };
         auto src_coded_array = convert(type->coded_array);
         auto dst_coded_array = convert(*type->coded_array.alt_type);
-        uint32_t dst_array_size = type->coded_array.alt_type->array_size;
-        return TransformArray(src_coded_array, dst_coded_array, position, dst_array_size,
+        return TransformArray(src_coded_array, dst_coded_array, position, dst_size,
                               out_traversal_result);
       }
       case fidl::kFidlTypeString:
@@ -340,15 +359,48 @@ class TransformerBase {
     // functions.
   }
 
+  zx_status_t TransformHandle(const Position& position, uint32_t dst_size,
+                              TraversalResult* out_traversal_result) {
+    auto presence = src_dst->Read<uint32_t>(position);
+    if (!presence) {
+      return Fail(ZX_ERR_BAD_STATE, "handle presence missing");
+    }
+    switch (*presence) {
+      case FIDL_HANDLE_ABSENT:
+        // Ok
+        break;
+      case FIDL_HANDLE_PRESENT:
+        out_traversal_result->handle_count++;
+        break;
+      default:
+        return Fail(ZX_ERR_BAD_STATE, "handle presence invalid");
+    }
+    return src_dst->Copy(position, dst_size);
+  }
+
   zx_status_t TransformStructPointer(const fidl::FidlCodedStruct& src_coded_struct,
                                      const fidl::FidlCodedStruct& dst_coded_struct,
                                      const Position& position,
                                      TraversalResult* out_traversal_result) {
-    auto presence = *src_dst->Read<uint64_t>(position);
-    src_dst->Copy(position, sizeof(uint64_t));
+    auto presence = src_dst->Read<uint64_t>(position);
+    if (!presence) {
+      return Fail(ZX_ERR_BAD_STATE, "struct pointer missing");
+    }
 
-    if (presence != FIDL_ALLOC_PRESENT) {
-      return ZX_OK;
+    auto status_copy_struct_pointer = src_dst->Copy(position, sizeof(uint64_t));
+    if (status_copy_struct_pointer != ZX_OK) {
+      return status_copy_struct_pointer;
+    }
+
+    switch (*presence) {
+      case FIDL_ALLOC_ABSENT:
+        // Early exit on absent struct.
+        return ZX_OK;
+      case FIDL_ALLOC_PRESENT:
+        // Ok
+        break;
+      default:
+        return Fail(ZX_ERR_BAD_STATE, "struct pointer invalid");
     }
 
     uint32_t src_aligned_size = FIDL_ALIGN(src_coded_struct.size);
@@ -378,14 +430,11 @@ class TransformerBase {
 
     // Copy structs without any coded fields, and done.
     if (src_coded_struct.field_count == 0) {
-      src_dst->Copy(position, dst_size);
-
-      return ZX_OK;
+      return src_dst->Copy(position, dst_size);
     }
 
     const uint32_t src_start_of_struct = position.src_inline_offset;
-    // only used in assert statements
-    const uint32_t dst_start_of_struct __attribute__((unused)) = position.dst_inline_offset;
+    const uint32_t dst_start_of_struct = position.dst_inline_offset;
 
     auto current_position = position;
     for (uint32_t field_index = 0; field_index < src_coded_struct.field_count; field_index++) {
@@ -395,14 +444,20 @@ class TransformerBase {
       if (!src_field.type) {
         const uint32_t dst_field_size =
             src_start_of_struct + src_field.padding_offset - current_position.src_inline_offset;
-        src_dst->Copy(current_position, dst_field_size);
+        const auto status_copy_field = src_dst->Copy(current_position, dst_field_size);
+        if (status_copy_field != ZX_OK) {
+          return status_copy_field;
+        }
         current_position = current_position.IncreaseInlineOffset(dst_field_size);
       } else {
         // The only case where the amount we've written shouldn't match the specified offset is
         // for request/response structs, where the txn header is not specified in the coding table.
         if (current_position.src_inline_offset != src_start_of_struct + src_field.offset) {
           assert(src_field.offset == dst_field.offset);
-          src_dst->Copy(current_position, src_field.offset);
+          const auto status_copy_field = src_dst->Copy(current_position, src_field.offset);
+          if (status_copy_field != ZX_OK) {
+            return status_copy_field;
+          }
           current_position = current_position.IncreaseInlineOffset(src_field.offset);
         }
         assert(current_position.src_inline_offset == src_start_of_struct + src_field.offset);
@@ -410,9 +465,9 @@ class TransformerBase {
 
         // Transform field.
         uint32_t src_next_field_offset =
-            current_position.src_inline_offset + AlignedInlineSize(src_field.type, From());
+            current_position.src_inline_offset + InlineSize(src_field.type, From());
         uint32_t dst_next_field_offset =
-            current_position.dst_inline_offset + AlignedInlineSize(dst_field.type, To());
+            current_position.dst_inline_offset + InlineSize(dst_field.type, To());
         uint32_t dst_field_size = dst_next_field_offset - (dst_start_of_struct + dst_field.offset);
 
         TraversalResult field_traversal_result;
@@ -431,21 +486,21 @@ class TransformerBase {
         current_position.dst_out_of_line_offset += field_traversal_result.dst_out_of_line_size;
       }
 
-      if (dst_field.padding) {
-        src_dst->Pad(current_position, dst_field.padding);
-        current_position = current_position.IncreaseDstInlineOffset(dst_field.padding);
+      // Pad (possibly with 0 bytes).
+      const auto status_pad = src_dst->Pad(current_position, dst_field.padding);
+      if (status_pad != ZX_OK) {
+        return Fail(status_pad, "unable to pad end of struct element");
       }
-
-      if (src_field.padding) {
-        current_position = current_position.IncreaseSrcInlineOffset(src_field.padding);
-      }
+      current_position = current_position.IncreaseDstInlineOffset(dst_field.padding);
+      current_position = current_position.IncreaseSrcInlineOffset(src_field.padding);
     }
 
-    // Pad end (if needed).
+    // Pad (possibly with 0 bytes).
     const uint32_t dst_end_of_struct = position.dst_inline_offset + dst_size;
-    if (current_position.dst_inline_offset < dst_end_of_struct) {
-      uint32_t size = dst_end_of_struct - current_position.dst_inline_offset;
-      src_dst->Pad(current_position, size);
+    const auto status_pad =
+        src_dst->Pad(current_position, dst_end_of_struct - current_position.dst_inline_offset);
+    if (status_pad != ZX_OK) {
+      return Fail(status_pad, "unable to pad end of struct");
     }
 
     return ZX_OK;
@@ -454,20 +509,31 @@ class TransformerBase {
   zx_status_t TransformVector(const fidl::FidlCodedVector& src_coded_vector,
                               const fidl::FidlCodedVector& dst_coded_vector,
                               const Position& position, TraversalResult* out_traversal_result) {
-    const auto& src_vector = *src_dst->Read<fidl_vector_t>(position);
+    const auto src_vector = src_dst->Read<fidl_vector_t>(position);
+    if (!src_vector) {
+      return Fail(ZX_ERR_BAD_STATE, "vector missing");
+    }
 
     // Copy vector header.
-    src_dst->Copy(position, sizeof(fidl_vector_t));
+    const auto status_copy_vector_hdr = src_dst->Copy(position, sizeof(fidl_vector_t));
+    if (status_copy_vector_hdr != ZX_OK) {
+      return status_copy_vector_hdr;
+    }
 
-    // Early exit on nullable vectors.  // TODO(apang): Switch() against FIDL_ALLOC_PRESENT and
-    // ABSENT (and eveyrwhere elese)
-    auto presence = reinterpret_cast<uint64_t>(src_vector.data);
-    if (presence != FIDL_ALLOC_PRESENT) {
-      return ZX_OK;
+    const auto presence = reinterpret_cast<uint64_t>(src_vector->data);
+    switch (presence) {
+      case FIDL_ALLOC_ABSENT:
+        // Early exit on nullable vectors.
+        return ZX_OK;
+      case FIDL_ALLOC_PRESENT:
+        // OK
+        break;
+      default:
+        return Fail(ZX_ERR_BAD_STATE, "vector presence invalid");
     }
 
     const auto convert = [&](const fidl::FidlCodedVector& coded_vector) {
-      return fidl::FidlCodedArrayNew(coded_vector.element, static_cast<uint32_t>(src_vector.count),
+      return fidl::FidlCodedArrayNew(coded_vector.element, static_cast<uint32_t>(src_vector->count),
                                      coded_vector.element_size, 0,
                                      nullptr /* alt_type unused, we provide both src and dst */);
     };
@@ -476,9 +542,9 @@ class TransformerBase {
 
     // Calculate vector size. They fit in uint32_t due to automatic bounds.
     uint32_t src_vector_size =
-        FIDL_ALIGN(static_cast<uint32_t>(src_vector.count * (src_coded_vector.element_size)));
+        FIDL_ALIGN(static_cast<uint32_t>(src_vector->count * (src_coded_vector.element_size)));
     uint32_t dst_vector_size =
-        FIDL_ALIGN(static_cast<uint32_t>(src_vector.count * (dst_coded_vector.element_size)));
+        FIDL_ALIGN(static_cast<uint32_t>(src_vector->count * (dst_coded_vector.element_size)));
 
     // Transform elements.
     auto vector_data_position = Position{
@@ -512,19 +578,39 @@ class TransformerBase {
   zx_status_t TransformEnvelope(bool known_type, const fidl_type_t* type, const Position& position,
                                 TraversalResult* out_traversal_result) {
     auto src_envelope = src_dst->Read<const fidl_envelope_t>(position);
+    if (!src_envelope) {
+      return Fail(ZX_ERR_BAD_STATE, "envelope missing");
+    }
 
-    if (src_envelope->presence == FIDL_ALLOC_ABSENT) {
-      src_dst->Copy(position, sizeof(fidl_envelope_t));
-      return ZX_OK;
+    switch (src_envelope->presence) {
+      case FIDL_ALLOC_ABSENT: {
+        const auto status = src_dst->Copy(position, sizeof(fidl_envelope_t));
+        if (status != ZX_OK) {
+          return Fail(status, "unable to copy envelope header");
+        }
+        return ZX_OK;
+      }
+      case FIDL_ALLOC_PRESENT:
+        // We write the transformed envelope after the transformation, since
+        // the num_bytes may be different in the dst.
+        break;
+      default:
+        return Fail(ZX_ERR_BAD_STATE, "envelope presence invalid");
     }
 
     if (!known_type) {
       // Unknown type, so we don't know what type of data the envelope contains.
-      src_dst->Copy(Position{position.src_out_of_line_offset,
-                             position.src_out_of_line_offset + src_envelope->num_bytes,
-                             position.dst_out_of_line_offset,
-                             position.dst_out_of_line_offset + src_envelope->num_bytes},
-                    src_envelope->num_bytes);
+      const auto data_position =
+          Position{position.src_out_of_line_offset,
+                   position.src_out_of_line_offset + src_envelope->num_bytes,
+                   position.dst_out_of_line_offset,
+                   position.dst_out_of_line_offset + src_envelope->num_bytes};
+      const auto status = src_dst->Copy(data_position, src_envelope->num_bytes);
+      if (status != ZX_OK) {
+        return Fail(status, "unable to copy envelope (unknown type)");
+      }
+      out_traversal_result->src_out_of_line_size += src_envelope->num_bytes;
+      out_traversal_result->dst_out_of_line_size += src_envelope->num_bytes;
       return ZX_OK;
     }
 
@@ -539,10 +625,10 @@ class TransformerBase {
         return src_envelope->num_bytes;
       }
 
-      return AlignedInlineSize(type, From());
+      return InlineSize(type, From());
     }();
 
-    const uint32_t dst_contents_inline_size = AlignedAltInlineSize(type);
+    const uint32_t dst_contents_inline_size = FIDL_ALIGN(AltInlineSize(type));
     Position data_position = Position{position.src_out_of_line_offset,
                                       position.src_out_of_line_offset + src_contents_inline_size,
                                       position.dst_out_of_line_offset,
@@ -561,7 +647,10 @@ class TransformerBase {
 
     fidl_envelope_t dst_envelope = *src_envelope;
     dst_envelope.num_bytes = dst_contents_size;
-    src_dst->Write(position, dst_envelope);
+    const auto status_write = src_dst->Write(position, dst_envelope);
+    if (status_write != ZX_OK) {
+      return Fail(status_write, "unable to write envelope");
+    }
 
     out_traversal_result->src_out_of_line_size += src_contents_size;
     out_traversal_result->dst_out_of_line_size += dst_contents_size;
@@ -573,7 +662,14 @@ class TransformerBase {
   zx_status_t TransformXUnion(const fidl::FidlCodedXUnion& coded_xunion, const Position& position,
                               TraversalResult* out_traversal_result) {
     auto xunion = src_dst->Read<const fidl_xunion_t>(position);
-    src_dst->Copy(position, sizeof(fidl_xunion_t));
+    if (!xunion) {
+      return Fail(ZX_ERR_BAD_STATE, "xunion missing");
+    }
+
+    const auto status_copy_xunion_hdr = src_dst->Copy(position, sizeof(fidl_xunion_t));
+    if (status_copy_xunion_hdr != ZX_OK) {
+      return status_copy_xunion_hdr;
+    }
 
     const fidl::FidlXUnionField* field = nullptr;
     for (uint32_t i = 0; i < coded_xunion.field_count; i++) {
@@ -598,11 +694,13 @@ class TransformerBase {
   zx_status_t TransformTable(const fidl::FidlCodedTable& coded_table, const Position& position,
                              TraversalResult* out_traversal_result) {
     auto table = src_dst->Read<const fidl_table_t>(position);
-    src_dst->Copy(position, sizeof(fidl_table_t));
+    if (!table) {
+      return Fail(ZX_ERR_BAD_STATE, "table header missing");
+    }
 
-    if (table->envelopes.count == 0) {
-      // Nothing to transform for empty tables.
-      return ZX_OK;
+    const auto status_copy_table_hdr = src_dst->Copy(position, sizeof(fidl_table_t));
+    if (status_copy_table_hdr != ZX_OK) {
+      return Fail(status_copy_table_hdr, "unable to copy table header");
     }
 
     const uint32_t envelopes_vector_size =
@@ -610,51 +708,36 @@ class TransformerBase {
     out_traversal_result->src_out_of_line_size += envelopes_vector_size;
     out_traversal_result->dst_out_of_line_size += envelopes_vector_size;
 
-    const auto envelopes_position = Position{position.src_out_of_line_offset, 0 /* unused */,
-                                             position.dst_out_of_line_offset, 0 /* unused */};
-
-    src_dst->Copy(envelopes_position, envelopes_vector_size);
-    const fidl_envelope_t* __attribute__((unused)) envelopes_array =
-        src_dst->Read<fidl_envelope_t>(envelopes_position);
-
-    uint32_t src_envelope_data_offset = envelopes_vector_size;
-    uint32_t dst_envelope_data_offset = src_envelope_data_offset;
-
-    for (uint32_t i = 0, field_index = 0; i < table->envelopes.count; i++) {
+    auto current_envelope_position = Position{
+        position.src_out_of_line_offset,
+        position.src_out_of_line_offset + envelopes_vector_size,
+        position.dst_out_of_line_offset,
+        position.dst_out_of_line_offset + envelopes_vector_size,
+    };
+    for (uint32_t ordinal = 1, field_index = 0; ordinal <= table->envelopes.count; ordinal++) {
       const fidl::FidlTableField& field = coded_table.fields[field_index];
 
-      // TODO(apang): Comment about why i+1 below.
-      if (i + 1 < field.ordinal) {
-        // This coded_table has some reserved fields before the first
-        // non-reserved field. The vector<envelope> includes all
-        // fields--including reserved fields--so skip reserved fields in the
-        // vector<envelope>.
-        continue;
+      const fidl_type_t* field_type = nullptr;
+      if (ordinal == field.ordinal) {
+        field_type = field.type;
+        field_index++;
       }
 
-      field_index++;
-
-      assert(field.ordinal == i + 1);
-
-      // TODO(apang): De-dupe below.
-      auto envelope_position = Position{
-          position.src_out_of_line_offset + i * static_cast<uint32_t>(sizeof(fidl_envelope_t)),
-          position.src_out_of_line_offset + src_envelope_data_offset,
-          position.dst_out_of_line_offset + i * static_cast<uint32_t>(sizeof(fidl_envelope_t)),
-          position.dst_out_of_line_offset + dst_envelope_data_offset,
-      };
-
       TraversalResult envelope_traversal_result;
-      zx_status_t status =
-          TransformEnvelope(true, field.type, envelope_position, &envelope_traversal_result);
-
+      zx_status_t status = TransformEnvelope(true, field_type, current_envelope_position,
+                                             &envelope_traversal_result);
       if (status != ZX_OK) {
         return status;
       }
 
-      assert(envelope_traversal_result.src_out_of_line_size == envelopes_array[i].num_bytes);
-      src_envelope_data_offset += envelope_traversal_result.src_out_of_line_size;
-      dst_envelope_data_offset += envelope_traversal_result.dst_out_of_line_size;
+      current_envelope_position.src_inline_offset +=
+        static_cast<uint32_t>(sizeof(fidl_envelope_t));
+      current_envelope_position.dst_inline_offset +=
+        static_cast<uint32_t>(sizeof(fidl_envelope_t));
+      current_envelope_position.src_out_of_line_offset +=
+          envelope_traversal_result.src_out_of_line_size;
+      current_envelope_position.dst_out_of_line_offset +=
+          envelope_traversal_result.dst_out_of_line_size;
 
       *out_traversal_result += envelope_traversal_result;
     }
@@ -670,8 +753,7 @@ class TransformerBase {
 
     // Fast path for elements without coding tables (e.g. strings).
     if (!src_coded_array.element) {
-      src_dst->Copy(position, dst_array_size);
-      return ZX_OK;
+      return src_dst->Copy(position, dst_array_size);
     }
 
     // Slow path otherwise.
@@ -689,7 +771,10 @@ class TransformerBase {
       auto padding_position =
           current_element_position.IncreaseSrcInlineOffset(src_coded_array.element_size)
               .IncreaseDstInlineOffset(dst_coded_array.element_size);
-      src_dst->Pad(padding_position, dst_coded_array.element_padding);
+      const auto status_pad = src_dst->Pad(padding_position, dst_coded_array.element_padding);
+      if (status_pad != ZX_OK) {
+        return Fail(status_pad, "unable to pad array element");
+      }
 
       current_element_position =
           padding_position.IncreaseSrcInlineOffset(src_coded_array.element_padding)
@@ -703,7 +788,10 @@ class TransformerBase {
     // Pad end of elements.
     uint32_t padding =
         dst_array_size + position.dst_inline_offset - current_element_position.dst_inline_offset;
-    src_dst->Pad(current_element_position, padding);
+    const auto status_pad = src_dst->Pad(current_element_position, padding);
+    if (status_pad != ZX_OK) {
+      return Fail(status_pad, "unable to pad end of array");
+    }
 
     return ZX_OK;
   }
@@ -747,12 +835,25 @@ class V1ToOld final : public TransformerBase {
                                     const Position& position,
                                     TraversalResult* out_traversal_result) {
     auto src_xunion = src_dst->Read<const fidl_xunion_t>(position);
-    if (src_xunion->envelope.presence != FIDL_ALLOC_PRESENT) {
-      src_dst->Write(position, FIDL_ALLOC_ABSENT);
-      return ZX_OK;
+    if (!src_xunion) {
+      return Fail(ZX_ERR_BAD_STATE, "union-as-xunion missing");
     }
 
-    src_dst->Write(position, FIDL_ALLOC_PRESENT);
+    switch (src_xunion->envelope.presence) {
+      case FIDL_ALLOC_ABSENT:
+      case FIDL_ALLOC_PRESENT: {
+        const auto status = src_dst->Write(position, src_xunion->envelope.presence);
+        if (status != ZX_OK) {
+          return Fail(status, "unable to write union pointer absence");
+        }
+        if (src_xunion->envelope.presence == FIDL_ALLOC_ABSENT) {
+          return ZX_OK;
+        }
+        break;
+      }
+      default:
+        return Fail(ZX_ERR_BAD_STATE, "union-as-xunion envelope presence invalid");
+    }
 
     const uint32_t dst_aligned_size = FIDL_ALIGN(dst_coded_union.size);
     const auto union_position = Position{
@@ -773,23 +874,23 @@ class V1ToOld final : public TransformerBase {
     assert(src_coded_union.field_count == dst_coded_union.field_count);
 
     // Read: extensible-union ordinal.
-    auto src_xunion = src_dst->Read<const fidl_xunion_t>(position);
-    uint32_t xunion_ordinal = src_xunion->tag;
-
-    if (src_xunion->padding != static_cast<decltype(src_xunion->padding)>(0)) {
-      return Fail(ZX_ERR_BAD_STATE, "xunion padding is non-zero");
+    const auto src_xunion = src_dst->Read<const fidl_xunion_t>(position);
+    if (!src_xunion) {
+      return Fail(ZX_ERR_BAD_STATE, "union-as-xunion missing");
     }
 
-    // TODO(apang): Can probably remove this validation here, the walker will validate it for us.
+    if (src_xunion->padding != static_cast<decltype(src_xunion->padding)>(0)) {
+      return Fail(ZX_ERR_BAD_STATE, "union-as-xunion padding is non-zero");
+    }
+
     switch (src_xunion->envelope.presence) {
       case FIDL_ALLOC_PRESENT:
         // OK
         break;
       case FIDL_ALLOC_ABSENT:
-        return Fail(ZX_ERR_BAD_STATE, "xunion envelope is invalid FIDL_ALLOC_ABSENT");
+        return Fail(ZX_ERR_BAD_STATE, "union-as-xunion envelope is invalid FIDL_ALLOC_ABSENT");
       default:
-        return Fail(ZX_ERR_BAD_STATE,
-                    "xunion envelope presence neither FIDL_ALLOC_PRESENT nor FIDL_ALLOC_ABSENT");
+        return Fail(ZX_ERR_BAD_STATE, "union-as-xunion envelope presence invalid");
     }
 
     // Retrieve: flexible-union field (or variant).
@@ -799,7 +900,7 @@ class V1ToOld final : public TransformerBase {
     for (/* src_field_index needed after the loop */; src_field_index < src_coded_union.field_count;
          src_field_index++) {
       const fidl::FidlUnionField* candidate_src_field = &src_coded_union.fields[src_field_index];
-      if (candidate_src_field->xunion_ordinal == xunion_ordinal) {
+      if (candidate_src_field->xunion_ordinal == src_xunion->tag) {
         src_field_found = true;
         src_field = candidate_src_field;
         break;
@@ -813,12 +914,20 @@ class V1ToOld final : public TransformerBase {
 
     // Write: static-union tag, and pad (if needed).
     switch (dst_coded_union.data_offset) {
-      case 4:
-        src_dst->Write(position, src_field_index);
+      case 4: {
+        const auto status = src_dst->Write(position, src_field_index);
+        if (status != ZX_OK) {
+          return Fail(status, "unable to write union tag");
+        }
         break;
-      case 8:
-        src_dst->Write(position, static_cast<uint64_t>(src_field_index));
+      }
+      case 8: {
+        const auto status = src_dst->Write(position, static_cast<uint64_t>(src_field_index));
+        if (status != ZX_OK) {
+          return Fail(status, "unable to write union tag");
+        }
         break;
+      }
       default:
         assert(false && "static-union data offset can only be 4 or 8");
     }
@@ -837,7 +946,7 @@ class V1ToOld final : public TransformerBase {
         return src_xunion->envelope.num_bytes;
       }
 
-      return AlignedInlineSize(src_field->type, From());
+      return FIDL_ALIGN(InlineSize(src_field->type, From()));
     }();
 
     // Transform: xunion field to static-union field (or variant).
@@ -858,7 +967,10 @@ class V1ToOld final : public TransformerBase {
 
     // Pad after static-union data.
     auto field_padding_position = field_position.IncreaseDstInlineOffset(dst_field_unpadded_size);
-    src_dst->Pad(field_padding_position, dst_field.padding);
+    const auto status_pad_field = src_dst->Pad(field_padding_position, dst_field.padding);
+    if (status_pad_field != ZX_OK) {
+      return Fail(status_pad_field, "unable to pad union variant");
+    }
 
     out_traversal_result->src_out_of_line_size += src_field_inline_size;
 
@@ -879,11 +991,25 @@ class OldToV1 final : public TransformerBase {
                                     const fidl::FidlCodedUnion& dst_coded_union,
                                     const Position& position,
                                     TraversalResult* out_traversal_result) {
-    auto presence = *src_dst->Read<uint64_t>(position);
-    if (presence != FIDL_ALLOC_PRESENT) {
-      fidl_xunion_t absent = {};
-      src_dst->Write(position, absent);
-      return ZX_OK;
+    auto presence = src_dst->Read<uint64_t>(position);
+    if (!presence) {
+      return Fail(ZX_ERR_BAD_STATE, "union pointer missing");
+    }
+
+    switch (*presence) {
+      case FIDL_ALLOC_ABSENT: {
+        fidl_xunion_t absent = {};
+        const auto status = src_dst->Write(position, absent);
+        if (status != ZX_OK) {
+          return Fail(status, "unbale to write union pointer absense");
+        }
+        return ZX_OK;
+      }
+      case FIDL_ALLOC_PRESENT:
+        // Ok
+        break;
+      default:
+        return Fail(ZX_ERR_BAD_STATE, "union pointer invalid");
     }
 
     uint32_t src_aligned_size = FIDL_ALIGN(src_coded_union.size);
@@ -904,7 +1030,11 @@ class OldToV1 final : public TransformerBase {
     assert(src_coded_union.field_count == dst_coded_union.field_count);
 
     // Read: union tag.
-    const fidl_union_tag_t union_tag = *src_dst->Read<const fidl_union_tag_t>(position);
+    const auto union_tag_ptr = src_dst->Read<const fidl_union_tag_t>(position);
+    if (!union_tag_ptr) {
+      return Fail(ZX_ERR_BAD_STATE, "union tag missing");
+    }
+    const auto union_tag = *union_tag_ptr;
 
     // Retrieve: union field/variant.
     if (union_tag >= src_coded_union.field_count) {
@@ -930,31 +1060,38 @@ class OldToV1 final : public TransformerBase {
         position.dst_out_of_line_offset,
         position.dst_out_of_line_offset + FIDL_ALIGN(dst_inline_field_size),
     };
-
-    TraversalResult traversal_result;
+    TraversalResult field_traversal_result;
     zx_status_t status =
-        Transform(src_field.type, field_position, dst_inline_field_size, &traversal_result);
+        Transform(src_field.type, field_position, dst_inline_field_size, &field_traversal_result);
     if (status != ZX_OK) {
       return status;
     }
 
-    const uint32_t dst_field_size = dst_inline_field_size + traversal_result.dst_out_of_line_size;
+    // Pad field (if needed).
+    const uint32_t dst_field_size =
+        dst_inline_field_size + field_traversal_result.dst_out_of_line_size;
+    const uint32_t dst_padding = FIDL_ALIGN(dst_field_size) - dst_field_size;
+    const auto status_pad_field =
+        src_dst->Pad(field_position.IncreaseDstInlineOffset(dst_field_size), dst_padding);
+    if (status_pad_field != ZX_OK) {
+      return Fail(status_pad_field, "unable to pad union-as-xunion variant");
+    }
 
+    // Write envelope header.
     fidl_xunion_t xunion;
     xunion.tag = dst_field.xunion_ordinal;
     xunion.padding = 0;
     xunion.envelope.num_bytes = FIDL_ALIGN(dst_field_size);
-    xunion.envelope.num_handles = traversal_result.handle_count;
+    xunion.envelope.num_handles = field_traversal_result.handle_count;
     xunion.envelope.presence = FIDL_ALLOC_PRESENT;
-    src_dst->Write(position, xunion);
+    const auto status_write_xunion = src_dst->Write(position, xunion);
+    if (status_write_xunion != ZX_OK) {
+      return Fail(status_write_xunion, "unable to write union-as-xunion header");
+    }
 
-    // Pad xunion data to object alignment.
-    const uint32_t dst_padding = FIDL_ALIGN(dst_field_size) - dst_field_size;
-    src_dst->PadOutOfLine(position.IncreaseDstOutOfLineOffset(dst_field_size), dst_padding);
-
-    out_traversal_result->src_out_of_line_size += traversal_result.src_out_of_line_size;
+    out_traversal_result->src_out_of_line_size += field_traversal_result.src_out_of_line_size;
     out_traversal_result->dst_out_of_line_size += FIDL_ALIGN(dst_field_size);
-    out_traversal_result->handle_count += traversal_result.handle_count;
+    out_traversal_result->handle_count += field_traversal_result.handle_count;
 
     return ZX_OK;
   }
@@ -964,7 +1101,8 @@ class OldToV1 final : public TransformerBase {
 
 zx_status_t fidl_transform(fidl_transformation_t transformation, const fidl_type_t* type,
                            const uint8_t* src_bytes, uint32_t src_num_bytes, uint8_t* dst_bytes,
-                           uint32_t* out_dst_num_bytes, const char** out_error_msg) {
+                           uint32_t dst_num_bytes_capacity, uint32_t* out_dst_num_bytes,
+                           const char** out_error_msg) {
   assert(type);
   assert(src_bytes);
   assert(dst_bytes);
@@ -972,19 +1110,19 @@ zx_status_t fidl_transform(fidl_transformation_t transformation, const fidl_type
   assert(fidl::IsAligned(src_bytes));
   assert(fidl::IsAligned(dst_bytes));
 
+  SrcDst src_dst(src_bytes, src_num_bytes, dst_bytes, dst_num_bytes_capacity, out_dst_num_bytes);
   switch (transformation) {
-    case FIDL_TRANSFORMATION_NONE:
-      memcpy(dst_bytes, src_bytes, src_num_bytes);
-      *out_dst_num_bytes = src_num_bytes;
-      return ZX_OK;
-    case FIDL_TRANSFORMATION_V1_TO_OLD: {
-      SrcDst src_dst(src_bytes, src_num_bytes, dst_bytes, out_dst_num_bytes);
+    case FIDL_TRANSFORMATION_NONE: {
+      const auto start = Position{
+          0, UINT16_MAX, /* unused: src_out_of_line_offset */
+          0, UINT16_MAX, /* unused: dst_out_of_line_offset */
+      };
+      return src_dst.Copy(start, src_num_bytes);
+    }
+    case FIDL_TRANSFORMATION_V1_TO_OLD:
       return V1ToOld(&src_dst, out_error_msg).TransformTopLevelStruct(type);
-    }
-    case FIDL_TRANSFORMATION_OLD_TO_V1: {
-      SrcDst src_dst(src_bytes, src_num_bytes, dst_bytes, out_dst_num_bytes);
+    case FIDL_TRANSFORMATION_OLD_TO_V1:
       return OldToV1(&src_dst, out_error_msg).TransformTopLevelStruct(type);
-    }
     default: {
       if (out_error_msg)
         *out_error_msg = "unsupported transformation";

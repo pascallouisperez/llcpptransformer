@@ -12,6 +12,7 @@ main: clean
 		-Wno-c++98-compat-pedantic \
 		-Wno-used-but-marked-unused \
 		-Wunused-parameter \
+		-Werror=conversion \
 		-idirafter "." \
 		-g -O0 \
 		-fsanitize=address -fno-omit-frame-pointer -fno-optimize-sibling-calls \

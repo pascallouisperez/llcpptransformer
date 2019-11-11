@@ -219,6 +219,45 @@ struct Regression4 {
     uint8 f6;
 };
 
+enum EnumUint32 {
+    MEMBER = 0x3231302F;
+};
+
+enum EnumUint8 : uint8 {
+    MEMBER = 0x08;
+};
+
+// Regression1, but with enums.
+struct Regression5 {
+    uint8 f1;
+    EnumUint32 f2;
+    EnumUint8 f3;
+    uint16 f4;
+    uint64 f5;
+    uint8 f6;
+};
+
+bits BitsUint32 {
+    MEMBER_LOW_1 = 0x00000001;
+    MEMBER_LOW_2 = 0x00000002;
+    MEMBER_HIG_1 = 0x10000000;
+    MEMBER_HIG_2 = 0x20000000;
+};
+
+bits BitsUint8 : uint8 {
+    MEMBER = 0x08;
+};
+
+// Regression1, but with bits.
+struct Regression6 {
+    uint8 f1;
+    BitsUint32 f2;
+    BitsUint8 f3;
+    uint16 f4;
+    uint64 f5;
+    uint8 f6;
+};
+
 table Table_NoFields {
 };
 
@@ -352,6 +391,40 @@ struct LauncherInfo {
     handle<channel>? directory_request;
     EmptyStruct? flat_namespace;
     EmptyStruct? additional_services;
+};
+
+union this_is_a_union {
+    1: string s;
+    2: bool b;
+};
+
+table this_is_a_table {
+    1: string s;
+};
+
+xunion this_is_a_xunion {
+    string s; // 0x3BC5BEBD
+    bool b;
+};
+
+table AllTypesTable {
+    1: this_is_a_union union_member;
+    2: array<uint32>:3 array_member;
+    3: this_is_a_table table_member;
+    4: this_is_a_xunion xunion_member;
+};
+
+struct CompatTable {
+    AllTypesTable value;
+    string empty;
+};
+
+table TableWithXUnion {
+    1: this_is_a_xunion member;
+};
+
+struct StructOfTableWithXUnion {
+    TableWithXUnion value;
 };
 
 protocol FakeProtocol {
