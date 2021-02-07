@@ -1,4 +1,4 @@
-main: clean
+main: $(glob *.cc *.h *.fidl) tables.h transformer_tests.cc
 	clang++ \
 		-std=c++14 \
 		-Weverything \
@@ -18,8 +18,12 @@ main: clean
 		-o main \
 		transformer.cc transformer_tests.cc fidl.cc
 
+tables.h: transformer.test.fidl
+	$$FUCHSIA_DIR/out/default/host_x64/fidlc --tables $@ --json $<.json --files $<
+	sed 's,#include <lib/fidl/internal.h>,#include "fidl.h",' -i $@
+
 clean:
-	rm -f *.o
+	rm -f main
 
 fromf:
 	cp $$FUCHSIA_DIR/zircon/system/utest/fidl/transformer.test.fidl .
